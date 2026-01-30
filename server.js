@@ -5,16 +5,13 @@ const axios = require("axios");
 const crypto = require("crypto");
 
 // ================= CONFIG =================
-//const PORT = 3000;
-const PORT = process.env.PORT || 3000;
-
-// GPS51 credentials
+const PORT = process.env.PORT || 3000; // Render or any host port
 const GPS51_USERNAME = "Niports"; // your GPS51 username
-const GPS51_PASSWORD = "Aa1357"; // PLAIN password
+const GPS51_PASSWORD = "Aa1357"; // your plain password
 const GPS51_BROWSER = "Chrome/104.0.0.0";
 // =========================================
 
-// MD5 password (GPS51 requirement)
+// MD5 password required by GPS51
 const MD5_PASSWORD = crypto
   .createHash("md5")
   .update(GPS51_PASSWORD)
@@ -31,6 +28,17 @@ const io = new Server(server, {
 let gpsToken = null;
 let gpsServerId = null;
 let loginInProgress = false;
+
+// ================= PUBLIC IP LOGGING =======
+async function getPublicIP() {
+  try {
+    const res = await axios.get("https://api.ipify.org?format=json");
+    console.log("Server public IP (for GPS51 whitelist):", res.data.ip);
+  } catch (err) {
+    console.error("Could not fetch public IP:", err.message);
+  }
+}
+getPublicIP();
 
 // ================= GPS51 LOGIN ============
 async function loginGPS51() {
@@ -72,11 +80,11 @@ async function loginGPS51() {
   }
 }
 
-// ================= SOCKET =================
+// ================= SOCKET.IO =================
 io.on("connection", (socket) => {
-  console.log("📱 Flutter connected:", socket.id);
+  console.log("📱 Flutter client connected:", socket.id);
 
-  // Flutter sends LIST of deviceIds
+  // Flutter sends a list of deviceIds
   socket.on("get:last_position", async ({ deviceIds }) => {
     if (!Array.isArray(deviceIds) || deviceIds.length === 0) {
       socket.emit("gps:error", {
@@ -85,6 +93,7 @@ io.on("connection", (socket) => {
       return;
     }
 
+    // Ensure GPS51 login
     if (!gpsToken) {
       await loginGPS51();
     }
@@ -113,12 +122,12 @@ io.on("connection", (socket) => {
       }
     }
 
-    // Send ONLY to requesting Flutter client
+    // Emit results only to the requesting client
     socket.emit("gps:last_position", results);
   });
 
   socket.on("disconnect", () => {
-    console.log("Flutter disconnected:", socket.id);
+    console.log("Flutter client disconnected:", socket.id);
   });
 });
 
