@@ -1,66 +1,52 @@
-/**
- * Niports Tracking Socket Server (GPS51)
- * --------------------------------------
- * - POST login (JSON body)
- * - Browser field set as requested
- * - Token reused safely
- * - Polling every 30s
- * - Emits JSON to Flutter
- * - Graceful handling when no lastposition data
- */
-
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const axios = require("axios");
 const crypto = require("crypto");
 
-// ================== CONFIG ==================
+// ================= CONFIG =================
 //const PORT = 3000;
 const PORT = process.env.PORT || 3000;
 
 // GPS51 credentials
-const GPS51_USERNAME = "Niports";
-const GPS51_PASSWORD = "Aa1357";
-const POLL_INTERVAL = 30000; // 30 seconds
-// ============================================
+const GPS51_USERNAME = "Niports"; // your GPS51 username
+const GPS51_PASSWORD = "Aa1357"; // PLAIN password
+const GPS51_BROWSER = "Chrome/104.0.0.0";
+// =========================================
 
-// MD5 password (32 digits, lowercase)
+// MD5 password (GPS51 requirement)
 const MD5_PASSWORD = crypto
   .createHash("md5")
   .update(GPS51_PASSWORD)
   .digest("hex");
 
-// ================== APP SETUP ==================
+// ================= APP ====================
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-// ================== GPS51 STATE ==================
+// ================= GPS51 STATE ============
 let gpsToken = null;
 let gpsServerId = null;
 let loginInProgress = false;
-let pollingStarted = false;
 
-// ================== GPS51 LOGIN ==================
+// ================= GPS51 LOGIN ============
 async function loginGPS51() {
-  if (loginInProgress || gpsToken) return;
+  if (gpsToken || loginInProgress) return;
 
   loginInProgress = true;
 
-  const loginUrl = "https://api.gps51.com/openapi?action=login";
-
   try {
     const res = await axios.post(
-      loginUrl,
+      "https://api.gps51.com/openapi?action=login",
       {
         type: "USER",
         from: "web",
         username: GPS51_USERNAME,
         password: MD5_PASSWORD,
-        browser: "Chrome/104.0.0.0",
+        browser: GPS51_BROWSER,
       },
       {
         headers: {
@@ -72,16 +58,12 @@ async function loginGPS51() {
       },
     );
 
-    console.log("Login response:", res.data);
-
     if (res.data && res.data.token) {
       gpsToken = res.data.token;
       gpsServerId = res.data.serverid;
       console.log("GPS51 login successful");
-
-      startPolling();
     } else {
-      console.error("GPS51 login failed");
+      console.error("GPS51 login failed:", res.data);
     }
   } catch (err) {
     console.error("GPS51 login error:", err.message);
@@ -90,51 +72,199 @@ async function loginGPS51() {
   }
 }
 
-// ================== POLLING ==================
-function startPolling() {
-  if (pollingStarted || !gpsToken) return;
-
-  pollingStarted = true;
-
-  setInterval(async () => {
-    try {
-      const url = `https://gps51.com/openapi?action=lastposition&token=${gpsToken}&serverid=${gpsServerId}`;
-      const res = await axios.get(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          Accept: "application/json",
-        },
-        timeout: 15000,
-      });
-
-      // Graceful handling of empty lastposition
-      let dataToEmit;
-      if (!res.data || (Array.isArray(res.data) && res.data.length === 0)) {
-        dataToEmit = { lat: null, lng: null, status: "no data" };
-      } else {
-        dataToEmit = res.data;
-      }
-
-      console.log("Last position:", dataToEmit);
-      io.emit("gps:update", dataToEmit);
-    } catch (err) {
-      console.error("GPS51 polling error:", err.message);
-      io.emit("gps:update", { lat: null, lng: null, status: "error" });
-    }
-  }, POLL_INTERVAL);
-}
-
-// ================== SOCKET.IO ==================
+// ================= SOCKET =================
 io.on("connection", (socket) => {
-  console.log("Flutter client connected:", socket.id);
+  console.log("📱 Flutter connected:", socket.id);
+
+  // Flutter sends LIST of deviceIds
+  socket.on("get:last_position", async ({ deviceIds }) => {
+    if (!Array.isArray(deviceIds) || deviceIds.length === 0) {
+      socket.emit("gps:error", {
+        message: "deviceIds must be a non-empty array",
+      });
+      return;
+    }
+
+    if (!gpsToken) {
+      await loginGPS51();
+    }
+
+    const results = [];
+
+    for (const deviceId of deviceIds) {
+      try {
+        const url =
+          `https://gps51.com/openapi?action=lastposition` +
+          `&token=${gpsToken}` +
+          `&serverid=${gpsServerId}` +
+          `&deviceid=${deviceId}`;
+
+        const res = await axios.get(url, { timeout: 15000 });
+
+        results.push({
+          deviceId,
+          response: res.data,
+        });
+      } catch (err) {
+        results.push({
+          deviceId,
+          error: err.message,
+        });
+      }
+    }
+
+    // Send ONLY to requesting Flutter client
+    socket.emit("gps:last_position", results);
+  });
 
   socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
+    console.log("Flutter disconnected:", socket.id);
   });
 });
 
-// ================== START SERVER ==================
-server.listen(PORT, () => {
+// ================= START SERVER ===========
+server.listen(PORT, async () => {
   console.log(`Niports Socket Server running on port ${PORT}`);
-  loginGPS51(); // login ONCE at startup
+  await loginGPS51();
 });
+
+// /**
+//  * Niports Tracking Socket Server (GPS51)
+//  * --------------------------------------
+//  * - POST login (JSON body)
+//  * - Browser field set as requested
+//  * - Token reused safely
+//  * - Polling every 30s
+//  * - Emits JSON to Flutter
+//  * - Graceful handling when no lastposition data
+//  */
+
+// const express = require("express");
+// const http = require("http");
+// const { Server } = require("socket.io");
+// const axios = require("axios");
+// const crypto = require("crypto");
+
+// // ================== CONFIG ==================
+// //const PORT = 3000;
+// const PORT = process.env.PORT || 3000;
+
+// // GPS51 credentials
+// const GPS51_USERNAME = "Niports";
+// const GPS51_PASSWORD = "Aa1357";
+// const POLL_INTERVAL = 30000; // 30 seconds
+// // ============================================
+
+// // MD5 password (32 digits, lowercase)
+// const MD5_PASSWORD = crypto
+//   .createHash("md5")
+//   .update(GPS51_PASSWORD)
+//   .digest("hex");
+
+// // ================== APP SETUP ==================
+// const app = express();
+// const server = http.createServer(app);
+// const io = new Server(server, {
+//   cors: { origin: "*" },
+// });
+
+// // ================== GPS51 STATE ==================
+// let gpsToken = null;
+// let gpsServerId = null;
+// let loginInProgress = false;
+// let pollingStarted = false;
+
+// // ================== GPS51 LOGIN ==================
+// async function loginGPS51() {
+//   if (loginInProgress || gpsToken) return;
+
+//   loginInProgress = true;
+
+//   const loginUrl = "https://api.gps51.com/openapi?action=login";
+
+//   try {
+//     const res = await axios.post(
+//       loginUrl,
+//       {
+//         type: "USER",
+//         from: "web",
+//         username: GPS51_USERNAME,
+//         password: MD5_PASSWORD,
+//         browser: "Chrome/104.0.0.0",
+//       },
+//       {
+//         headers: {
+//           "Content-Type": "application/json",
+//           "User-Agent": "Mozilla/5.0",
+//           Accept: "application/json",
+//         },
+//         timeout: 15000,
+//       },
+//     );
+
+//     console.log("Login response:", res.data);
+
+//     if (res.data && res.data.token) {
+//       gpsToken = res.data.token;
+//       gpsServerId = res.data.serverid;
+//       console.log("GPS51 login successful");
+
+//       startPolling();
+//     } else {
+//       console.error("GPS51 login failed");
+//     }
+//   } catch (err) {
+//     console.error("GPS51 login error:", err.message);
+//   } finally {
+//     loginInProgress = false;
+//   }
+// }
+
+// // ================== POLLING ==================
+// function startPolling() {
+//   if (pollingStarted || !gpsToken) return;
+
+//   pollingStarted = true;
+
+//   setInterval(async () => {
+//     try {
+//       const url = `https://gps51.com/openapi?action=lastposition&token=${gpsToken}&serverid=${gpsServerId}`;
+//       const res = await axios.get(url, {
+//         headers: {
+//           "User-Agent": "Mozilla/5.0",
+//           Accept: "application/json",
+//         },
+//         timeout: 15000,
+//       });
+
+//       // Graceful handling of empty lastposition
+//       let dataToEmit;
+//       if (!res.data || (Array.isArray(res.data) && res.data.length === 0)) {
+//         dataToEmit = { lat: null, lng: null, status: "no data" };
+//       } else {
+//         dataToEmit = res.data;
+//       }
+
+//       console.log("Last position:", dataToEmit);
+//       io.emit("gps:update", dataToEmit);
+//     } catch (err) {
+//       console.error("GPS51 polling error:", err.message);
+//       io.emit("gps:update", { lat: null, lng: null, status: "error" });
+//     }
+//   }, POLL_INTERVAL);
+// }
+
+// // ================== SOCKET.IO ==================
+// io.on("connection", (socket) => {
+//   console.log("Flutter client connected:", socket.id);
+
+//   socket.on("disconnect", () => {
+//     console.log("Client disconnected:", socket.id);
+//   });
+// });
+
+// // ================== START SERVER ==================
+// server.listen(PORT, () => {
+//   console.log(`Niports Socket Server running on port ${PORT}`);
+//   loginGPS51(); // login ONCE at startup
+// });
