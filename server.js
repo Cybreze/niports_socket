@@ -3,49 +3,51 @@ const http = require("http");
 const { Server } = require("socket.io");
 const axios = require("axios");
 const crypto = require("crypto");
+const os = require("os");
 
 // ================= CONFIG =================
-const PORT = process.env.PORT || 3000; // Render or any host port
-const GPS51_USERNAME = "Niports"; // your GPS51 username
-const GPS51_PASSWORD = "Aa1357"; // your plain password
-const GPS51_BROWSER = "Chrome/104.0.0.0";
+const PORT = process.env.PORT || 3000;
+
+// GPS51 credentials
+const GPS51_USERNAME = "Niports";
+const GPS51_PASSWORD = "Aa1357"; // plain password
+const POLL_INTERVAL = 30000; // 30 seconds
 // =========================================
 
-// MD5 password required by GPS51
+// MD5 (32 chars, lowercase)
 const MD5_PASSWORD = crypto
   .createHash("md5")
   .update(GPS51_PASSWORD)
   .digest("hex");
 
-// ================= APP ====================
+// ================= APP SETUP =================
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-// ================= GPS51 STATE ============
+// ================= GPS51 STATE =================
 let gpsToken = null;
 let gpsServerId = null;
-let loginInProgress = false;
+let lastKnownPositions = [];
+let lastServerIP = null;
 
-// ================= PUBLIC IP LOGGING =======
-async function getPublicIP() {
-  try {
-    const res = await axios.get("https://api.ipify.org?format=json");
-    console.log("Server public IP (for GPS51 whitelist):", res.data.ip);
-  } catch (err) {
-    console.error("Could not fetch public IP:", err.message);
+// ================= GET SERVER IP =================
+function getServerIP() {
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name]) {
+      if (net.family === "IPv4" && !net.internal) {
+        return net.address;
+      }
+    }
   }
+  return "UNKNOWN";
 }
-getPublicIP();
 
-// ================= GPS51 LOGIN ============
+// ================= LOGIN GPS51 =================
 async function loginGPS51() {
-  if (gpsToken || loginInProgress) return;
-
-  loginInProgress = true;
-
   try {
     const res = await axios.post(
       "https://api.gps51.com/openapi?action=login",
@@ -54,76 +56,98 @@ async function loginGPS51() {
         from: "web",
         username: GPS51_USERNAME,
         password: MD5_PASSWORD,
-        browser: GPS51_BROWSER,
+        browser: "Chrome/104.0.0.0",
       },
       {
         headers: {
           "Content-Type": "application/json",
-          "User-Agent": "Mozilla/5.0",
           Accept: "application/json",
         },
         timeout: 15000,
       },
     );
 
-    if (res.data && res.data.token) {
+    if (res.data?.token) {
       gpsToken = res.data.token;
       gpsServerId = res.data.serverid;
+
       console.log("GPS51 login successful");
+      startPolling();
     } else {
       console.error("GPS51 login failed:", res.data);
     }
   } catch (err) {
     console.error("GPS51 login error:", err.message);
-  } finally {
-    loginInProgress = false;
   }
+}
+
+// ================= POLLING =================
+function startPolling() {
+  setInterval(async () => {
+    if (!gpsToken) return;
+
+    // ---- IP CHANGE CHECK ----
+    const currentIP = getServerIP();
+    if (currentIP !== lastServerIP) {
+      lastServerIP = currentIP;
+
+      console.log("SERVER IP CHANGED:", currentIP);
+
+      io.emit("gps:status", {
+        message: "Server IP changed – whitelist this IP on GPS51",
+        ip: currentIP,
+        changed: true,
+      });
+    }
+
+    try {
+      const url = `https://gps51.com/openapi?action=lastposition&token=${gpsToken}&serverid=${gpsServerId}`;
+      const res = await axios.get(url, { timeout: 15000 });
+
+      lastKnownPositions = Array.isArray(res.data?.data) ? res.data.data : [];
+    } catch (err) {
+      console.error("GPS51 polling error:", err.message);
+    }
+  }, POLL_INTERVAL);
 }
 
 // ================= SOCKET.IO =================
 io.on("connection", (socket) => {
   console.log("📱 Flutter client connected:", socket.id);
 
-  // Flutter sends a list of deviceIds
-  socket.on("get:last_position", async ({ deviceIds }) => {
-    if (!Array.isArray(deviceIds) || deviceIds.length === 0) {
+  // Send server IP immediately
+  socket.emit("gps:status", {
+    message: "Socket connected",
+    ip: getServerIP(),
+    changed: false,
+  });
+
+  // Track devices (single or multiple)
+  socket.on("track:devices", ({ deviceids }) => {
+    if (!Array.isArray(deviceids) || deviceids.length === 0) {
       socket.emit("gps:error", {
-        message: "deviceIds must be a non-empty array",
+        message: "deviceids must be a non-empty array",
       });
       return;
     }
 
-    // Ensure GPS51 login
-    if (!gpsToken) {
-      await loginGPS51();
+    const results = lastKnownPositions.filter((d) =>
+      deviceids.includes(d.deviceid),
+    );
+
+    if (results.length === 0) {
+      socket.emit("gps:error", {
+        message: "No matching device found",
+        deviceids,
+      });
+      return;
     }
 
-    const results = [];
-
-    for (const deviceId of deviceIds) {
-      try {
-        const url =
-          `https://gps51.com/openapi?action=lastposition` +
-          `&token=${gpsToken}` +
-          `&serverid=${gpsServerId}` +
-          `&deviceid=${deviceId}`;
-
-        const res = await axios.get(url, { timeout: 15000 });
-
-        results.push({
-          deviceId,
-          response: res.data,
-        });
-      } catch (err) {
-        results.push({
-          deviceId,
-          error: err.message,
-        });
-      }
-    }
-
-    // Emit results only to the requesting client
-    socket.emit("gps:last_position", results);
+    socket.emit("gps:update", {
+      changed: true,
+      count: results.length,
+      data: results,
+    });
   });
 
   socket.on("disconnect", () => {
@@ -131,10 +155,11 @@ io.on("connection", (socket) => {
   });
 });
 
-// ================= START SERVER ===========
-server.listen(PORT, async () => {
+// ================= START SERVER =================
+server.listen(PORT, () => {
   console.log(`Niports Socket Server running on port ${PORT}`);
-  await loginGPS51();
+  console.log("Server IP:", getServerIP());
+  loginGPS51();
 });
 
 // /**
